@@ -5,3 +5,4 @@ mediapipe==0.10.10
 numpy>=1.24
 streamlit-webrtc
 av
+streamlit_autorefresh
