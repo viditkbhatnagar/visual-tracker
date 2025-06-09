@@ -11,10 +11,11 @@ import mediapipe as mp
 import numpy as np
 import math
 import time
-# face detection model for landmark confidence
-mp_face_detection = mp.solutions.face_detection
 from collections import deque
-from threading import Thread
+
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
+import av
+from streamlit_autorefresh import st_autorefresh
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 1. Mediapipe initialisation
@@ -45,9 +46,8 @@ def _init_models():
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-    face_detection = mp_face_detection.FaceDetection(min_detection_confidence=0.5)
     segmentor = mp_selfie_segmentation.SelfieSegmentation(model_selection=0)
-    return face_mesh, face_detection, segmentor
+    return face_mesh, segmentor
 
 def get_head_pose(image_points, focal_len, img_center):
     success, rot_vec, trans_vec = cv2.solvePnP(
@@ -85,27 +85,155 @@ def classify_orientation(yaw, pitch, roll, tol=15):
     if pitch < -tol: return "UP"
     return "CENTER"
 
-# ────────────────────────────────────────────────────────────────────────────────
-# New helper: Eye Aspect Ratio for blink detection
-LEFT_EYE_IDX  = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE_IDX = [362,385,387,263,373,380]
-BLINK_THRESH = 0.20
+# WebRTC configuration for browser-based real-time video
+RTC_CONFIGURATION = RTCConfiguration({"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]})
 
-def eye_aspect_ratio(landmarks, idxs):
-    # compute EAR
-    p = landmarks
-    a = np.linalg.norm(np.array([p[idxs[1]].x, p[idxs[1]].y]) - np.array([p[idxs[5]].x, p[idxs[5]].y]))
-    b = np.linalg.norm(np.array([p[idxs[2]].x, p[idxs[2]].y]) - np.array([p[idxs[4]].x, p[idxs[4]].y]))
-    c = np.linalg.norm(np.array([p[idxs[0]].x, p[idxs[0]].y]) - np.array([p[idxs[3]].x, p[idxs[3]].y]))
-    return (a + b) / (2.0 * c)
+class AttentionProcessor(VideoProcessorBase):
+    """
+    VideoProcessor that applies Mediapipe face/eye/head/body metrics per frame.
+    Stores latest metrics in self.metrics.
+    """
+    def __init__(self):
+        super().__init__()
+        self.metrics = {}
+
+        # Initialize models and motion detector here for use in processor
+        global face_mesh
+        global motion_detector
+        global face_detection
+        # Initialize face_mesh and motion_detector if not already
+        if 'face_mesh' not in globals():
+            face_mesh, _ = _init_models()
+        if 'motion_detector' not in globals():
+            motion_detector = MotionDetector()
+        # Face detection model for confidence
+        mp_face_detection = mp.solutions.face_detection
+        self.face_detection = mp_face_detection.FaceDetection(min_detection_confidence=0.5)
+        self.prev_blink = False
+        self.blink_times = deque(maxlen=100)
+        self.prev_time = time.time()
+        self.fps = 0.0
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        h, w = img.shape[:2]
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Run face detection for confidence
+        det = self.face_detection.process(rgb)
+        landmark_confidence = 0.0
+        if det.detections:
+            landmark_confidence = max([d.score[0] for d in det.detections]) * 100
+
+        # Motion detection
+        status = "STATIC"
+        intensity = 0
+        if hasattr(motion_detector, 'update'):
+            res_motion = motion_detector.update(gray)
+            if isinstance(res_motion, tuple):
+                status, intensity = res_motion
+            else:
+                status = res_motion
+                intensity = 0
+
+        if intensity < 1: motion_level="LOW"
+        elif intensity < 5: motion_level="MEDIUM"
+        else: motion_level="HIGH"
+
+        # FaceMesh inference
+        res = face_mesh.process(rgb)
+        # Default metrics
+        face_detected = False; eye_contact=False; head_orientation="Unknown"; extra_person=False
+        blink_status=False; blink_rate=0; face_distance="Unknown"; lip_status=False
+        yaw=pitch=roll=0.0
+
+        now = time.time()
+        delta = now - self.prev_time
+        if delta > 0:
+            self.fps = 1.0 / delta
+        self.prev_time = now
+
+        # track blink times in global deque
+        if res.multi_face_landmarks:
+            face_detected=True
+            n_faces=len(res.multi_face_landmarks)
+            extra_person = n_faces>1
+            for idx, lm in enumerate(res.multi_face_landmarks):
+                pts = lm.landmark
+                # head pose
+                img_pts = np.array([(pts[i].x*w, pts[i].y*h) for i in FACE_LANDMARK_IDXS], dtype=np.float64)
+                yaw,pitch,roll = get_head_pose(img_pts, focal_len=w, img_center=(w/2,h/2))
+                if idx==0:
+                    eye_contact = is_eye_contact(pts, w, h)
+                    # blink
+                    # Define eye aspect ratio function and indices for blink detection
+                    def eye_aspect_ratio(landmarks, eye_indices):
+                        # Compute euclidean distances between vertical eye landmarks
+                        A = math.dist((landmarks[eye_indices[1]].x, landmarks[eye_indices[1]].y),
+                                      (landmarks[eye_indices[5]].x, landmarks[eye_indices[5]].y))
+                        B = math.dist((landmarks[eye_indices[2]].x, landmarks[eye_indices[2]].y),
+                                      (landmarks[eye_indices[4]].x, landmarks[eye_indices[4]].y))
+                        # Compute euclidean distance between horizontal eye landmarks
+                        C = math.dist((landmarks[eye_indices[0]].x, landmarks[eye_indices[0]].y),
+                                      (landmarks[eye_indices[3]].x, landmarks[eye_indices[3]].y))
+                        ear = (A + B) / (2.0 * C)
+                        return ear
+                    LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+                    RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+                    BLINK_THRESH = 0.2
+
+                    ear=(eye_aspect_ratio(pts,LEFT_EYE_IDX)+eye_aspect_ratio(pts,RIGHT_EYE_IDX))/2.0
+                    if ear<BLINK_THRESH and not self.prev_blink:
+                        self.blink_times.append(now)
+                        self.prev_blink=True
+                    elif ear>=BLINK_THRESH:
+                        self.prev_blink=False
+                    blink_rate = len([t for t in self.blink_times if now-t<60])
+                    blink_status = ear<BLINK_THRESH
+                    # face distance
+                    xs = [p.x for p in pts]; ys = [p.y for p in pts]
+                    min_x, max_x = min(xs) * w, max(xs) * w
+                    min_y, max_y = min(ys) * h, max(ys) * h
+                    area_frac = ((max_x - min_x) * (max_y - min_y)) / (w * h)
+                    if area_frac<0.10: face_distance="FAR"
+                    elif area_frac<0.20: face_distance="IDEAL"
+                    else: face_distance="NEAR"
+                    # lip movement
+                    upper=np.array([pts[13].x*w,pts[13].y*h]); lower=np.array([pts[14].x*w,pts[14].y*h])
+                    left_pt=np.array([pts[78].x*w,pts[78].y*h]); right_pt=np.array([pts[308].x*w,pts[308].y*h])
+                    mar=np.linalg.norm(upper-lower)/np.linalg.norm(left_pt-right_pt)
+                    lip_status=mar>0.03
+        # Save metrics
+        self.metrics = {
+            "Face Detected": "YES" if face_detected else "NO",
+            "Eye Contact": "YES" if eye_contact else "NO",
+            "Head Orientation": head_orientation,
+            "Body Movement": status,
+            "Additional Person": "YES" if extra_person else "NO",
+            "Blink Status": "YES" if blink_status else "NO",
+            "Blink Rate": str(blink_rate),
+            "Face Distance": face_distance,
+            "Yaw (°)": f"{yaw:.1f}",
+            "Pitch (°)": f"{pitch:.1f}",
+            "Roll (°)": f"{roll:.1f}",
+            "Motion Level": motion_level,
+            "Landmark Confidence (%)": f"{landmark_confidence:.1f}",
+            "Frame Rate": f"{self.fps:.1f}",
+            "Lip Movement": "YES" if lip_status else "NO"
+        }
+
+        # Overlay a simple border for gaze
+        color = (0,255,0) if eye_contact else (0,0,255)
+        cv2.rectangle(img, (0,0),(w,h), color, 2)
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 3. Motion detector
 # ────────────────────────────────────────────────────────────────────────────────
 class MotionDetector:
-    def __init__(self, buf_len=5, thresh=25):
+    def __init__(self, buf_len=5, thresh_percent=1):
         self.queue = deque(maxlen=buf_len)
-        self.thresh = thresh
+        self.thresh_percent = thresh_percent
 
     def update(self, gray_frame):
         self.queue.append(gray_frame)
@@ -113,184 +241,42 @@ class MotionDetector:
             return "STATIC", 0.0
         diff = cv2.absdiff(self.queue[0], gray_frame)
         non_zero = cv2.countNonZero(diff)
-        intensity = non_zero / (gray_frame.shape[0]*gray_frame.shape[1]) * 100
-        status = "MOVING" if non_zero > self.thresh * 1000 else "STATIC"
+        total_px = gray_frame.shape[0] * gray_frame.shape[1]
+        intensity = (non_zero / total_px) * 100  # percent changed
+        status = "MOVING" if intensity > self.thresh_percent else "STATIC"
         return status, intensity
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 4. Threaded video capture
-# ────────────────────────────────────────────────────────────────────────────────
-class VideoStream:
-    def __init__(self, src=0):
-        self.cap = cv2.VideoCapture(src)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.running = True
-        self.frame = None
-        Thread(target=self.update, daemon=True).start()
-
-    def update(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if ret:
-                self.frame = cv2.flip(frame, 1)
-
-    def read(self):
-        return self.frame
-
-    def stop(self):
-        self.running = False
-        self.cap.release()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 5. Streamlit UI
 # ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config("Attention Monitor", layout="wide")
-st.title("🧿 Real-Time Attention & Presence Monitor")
-
-col_vid, col_metrics = st.columns([3,1], gap="large")
-with col_vid:
-    placeholder_video = st.empty()
-with col_metrics:
-    st.header("🔍 Live Metrics")
-    metric_table = st.empty()
+st.title("Real-Time Attention & Presence Monitor")
 
 st.info("Please grant camera access ⬆️ (your browser will prompt).")
 
-face_mesh, face_detection, segmentor = _init_models()
+face_mesh, segmentor = _init_models()
 motion_detector = MotionDetector()
-stream = VideoStream(0)
 
-from collections import deque
-# before loop: 
-blink_times = deque()
-prev_blink = False
-fps_times = deque(maxlen=30)
+# Auto-refresh every second for metrics updates
+st_autorefresh(interval=1000, key="refresh")
 
-try:
-    while True:
-        frame = stream.read()
-        if frame is None:
-            time.sleep(0.01)
-            continue
+col_vid, col_metrics = st.columns([3,1], gap="large")
 
-        h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+with col_vid:
+    webrtc_ctx = webrtc_streamer(
+        key="monitor",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        video_processor_factory=AttentionProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
-        # detect faces for confidence
-        det_results = face_detection.process(rgb)
-        landmark_confidence = 0.0
-        if det_results.detections:
-            landmark_confidence = max([d.score[0] for d in det_results.detections]) * 100
-
-        # track timestamp for FPS
-        now = time.time()
-        fps_times.append(now)
-        fps = len(fps_times) / (fps_times[-1] - fps_times[0]) if len(fps_times)>1 else 0.0
-
-        face_detected = False; eye_contact = False; head_orientation = "Unknown"; extra_person = False
-        blink_status = False; blink_rate = 0
-        face_distance_label = "Unknown"
-        motion_level = "LOW"
-        lip_status = False
-
-        results = face_mesh.process(rgb)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        body_status, motion_intensity = motion_detector.update(gray)
-        if motion_intensity < 1: motion_level="LOW"
-        elif motion_intensity < 5: motion_level="MEDIUM"
-        else: motion_level="HIGH"
-
-        yaw = pitch = roll = 0.0
-
-        if results.multi_face_landmarks:
-            face_detected = True
-            n_faces = len(results.multi_face_landmarks)
-            extra_person = n_faces > 1
-
-            for idx, landmarks in enumerate(results.multi_face_landmarks):
-                lm = landmarks.landmark
-                image_points = np.array([
-                    (lm[i].x * w, lm[i].y * h)
-                    for i in FACE_LANDMARK_IDXS
-                ], dtype=np.float64)
-                yaw, pitch, roll = get_head_pose(
-                    image_points, focal_len=w, img_center=(w/2, h/2)
-                )
-                if idx == 0:
-                    head_orientation = classify_orientation(yaw, pitch, roll)
-                    eye_contact = is_eye_contact(lm, w, h)
-                    # blink detection
-                    ear = (eye_aspect_ratio(lm, LEFT_EYE_IDX) + eye_aspect_ratio(lm, RIGHT_EYE_IDX)) / 2.0
-                    if ear < BLINK_THRESH and not prev_blink:
-                        blink_times.append(now)
-                        prev_blink = True
-                    elif ear >= BLINK_THRESH:
-                        prev_blink = False
-                    blink_rate = len([t for t in blink_times if now - t < 60])
-                    blink_status = ear < BLINK_THRESH
-
-                    # face distance (% of frame area)
-                    xs = [p.x for p in lm]; ys = [p.y for p in lm]
-                    min_x, max_x = min(xs)*w, max(xs)*w
-                    min_y, max_y = min(ys)*h, max(ys)*h
-                    area_frac = ((max_x-min_x)*(max_y-min_y)) / (w*h)
-                    if area_frac < 0.10: face_distance_label = "FAR"
-                    elif area_frac < 0.20: face_distance_label = "IDEAL"
-                    else: face_distance_label = "NEAR"
-
-                    # lip movement (MAR)
-                    upper = np.array([lm[13].x*w, lm[13].y*h]); lower = np.array([lm[14].x*w, lm[14].y*h])
-                    left = np.array([lm[78].x*w, lm[78].y*h]); right = np.array([lm[308].x*w, lm[308].y*h])
-                    mar = np.linalg.norm(upper-lower) / np.linalg.norm(left-right)
-                    lip_status = mar > 0.03
-
-                mp_drawing.draw_landmarks(
-                    frame, landmarks, mp_face_mesh.FACEMESH_TESSELATION,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_drawing.DrawingSpec(
-                        thickness=1, circle_radius=1)
-                )
-
-        border_color = (0, 255, 0) if eye_contact else (0, 0, 255)
-        cv2.rectangle(frame, (0, 0), (w, h), border_color, 2)
-        cv2.putText(
-            frame,
-            f"Faces:{'0' if not face_detected else ('1' if not extra_person else '>1')}",
-            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, border_color, 2)
-
-        with col_vid:
-            placeholder_video.image(frame, channels="BGR", use_container_width=True)
-        matrix_data = {
-            "Metric": [
-                "Face Detected","Eye Contact","Head Orientation","Body Movement","Additional Person",
-                "Blink Status","Blink Rate","Face Distance","Yaw (°)","Pitch (°)","Roll (°)",
-                "Motion Level","Landmark Confidence (%)","Frame Rate","Lip Movement"
-            ],
-            "Value": [
-                "YES" if face_detected else "NO",
-                "YES" if eye_contact else "NO",
-                head_orientation,
-                body_status,
-                "YES" if extra_person else "NO",
-                "YES" if blink_status else "NO",
-                str(blink_rate),
-                face_distance_label,
-                f"{yaw:.1f}",f"{pitch:.1f}",f"{roll:.1f}",
-                motion_level,
-                f"{landmark_confidence:.1f}",
-                f"{fps:.1f}",
-                "YES" if lip_status else "NO"
-            ]
-        }
-        with col_metrics:
-            metric_table.table(matrix_data)
-
-        # ←–– replaced st.sleep with time.sleep
-        time.sleep(0.03)
-
-except KeyboardInterrupt:
-    pass
-finally:
-    stream.stop()
-    st.info("🛑 Stream stopped.")
+with col_metrics:
+    st.header("🔍 Live Metrics")
+    placeholder = st.empty()
+    if webrtc_ctx and webrtc_ctx.video_processor and webrtc_ctx.video_processor.metrics:
+        placeholder.table({
+            "Metric": list(webrtc_ctx.video_processor.metrics.keys()),
+            "Value": list(webrtc_ctx.video_processor.metrics.values())
+        })
