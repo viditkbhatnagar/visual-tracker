@@ -86,23 +86,20 @@ def classify_orientation(yaw, pitch, roll, tol=15):
     return "CENTER"
 
 # Plain ICE config dict (STUN only)
+# Force relay over public TURN (openrelay)
 RTC_CONFIGURATION = {
     "iceServers": [
-        {  # STUN
+        {
             "urls": [
-                "stun:stun.l.google.com:19302"
-            ]
-        },
-        {  # public TURN relay (demo)
-            "urls": [
-                "turn:openrelay.metered.ca:80",
-                "turn:openrelay.metered.ca:443",
+                # TCP 443 guarantees egress from most PaaS
                 "turn:openrelay.metered.ca:443?transport=tcp"
             ],
             "username": "openrelayproject",
             "credential": "openrelayproject"
         }
-    ]
+    ],
+    # <--- force browser & aiortc to skip host/srflx candidates
+    "iceTransportPolicy": "relay"
 }
 
 class AttentionProcessor(VideoProcessorBase):
