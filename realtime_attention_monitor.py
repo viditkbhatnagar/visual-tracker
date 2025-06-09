@@ -88,7 +88,20 @@ def classify_orientation(yaw, pitch, roll, tol=15):
 # Plain ICE config dict (STUN only)
 RTC_CONFIGURATION = {
     "iceServers": [
-        {"urls": "stun:stun.l.google.com:19302"}
+        {  # STUN
+            "urls": [
+                "stun:stun.l.google.com:19302"
+            ]
+        },
+        {  # public TURN relay (demo)
+            "urls": [
+                "turn:openrelay.metered.ca:80",
+                "turn:openrelay.metered.ca:443",
+                "turn:openrelay.metered.ca:443?transport=tcp"
+            ],
+            "username": "openrelayproject",
+            "credential": "openrelayproject"
+        }
     ]
 }
 
