@@ -13,7 +13,7 @@ import math
 import time
 from collections import deque
 
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 from streamlit_autorefresh import st_autorefresh
 
@@ -85,8 +85,12 @@ def classify_orientation(yaw, pitch, roll, tol=15):
     if pitch < -tol: return "UP"
     return "CENTER"
 
-# WebRTC configuration for browser-based real-time video
-RTC_CONFIGURATION = RTCConfiguration({"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]})
+# Plain ICE config dict (STUN only)
+RTC_CONFIGURATION = {
+    "iceServers": [
+        {"urls": "stun:stun.l.google.com:19302"}
+    ]
+}
 
 class AttentionProcessor(VideoProcessorBase):
     """
