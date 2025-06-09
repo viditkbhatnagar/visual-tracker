@@ -87,6 +87,7 @@ def classify_orientation(yaw, pitch, roll, tol=15):
 
 # Plain ICE config dict (STUN only)
 # Force relay over public TURN (openrelay)
+# Force relay over public TURN (openrelay)
 RTC_CONFIGURATION = {
     "iceServers": [
         {
